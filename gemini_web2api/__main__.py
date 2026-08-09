@@ -29,6 +29,10 @@ def main():
     if args.proxy:
         CONFIG["proxy"] = args.proxy
 
+    new_bl = fetch_latest_bl()
+    if new_bl:
+        CONFIG["gemini_bl"] = new_bl
+
     port = CONFIG["port"]
     server = ThreadedServer((CONFIG["host"], port), GeminiHandler)
     print(f"gemini-web2api v{__version__}")
