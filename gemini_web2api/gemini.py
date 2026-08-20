@@ -21,6 +21,41 @@ _ssl_ctx = None
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
 _httpx_client = None
 
+# BardErrorInfo frames look like `...BardErrorInfo",[1060]]` (possibly escaped
+# inside the wrb.fr JSON string). The old regex `BardErrorInfo\s*\[...\]` never
+# matched that shape, so rejections were silently swallowed as empty responses
+# and no retry ever fired.
+_BARD_ERROR_RE = re.compile(r'BardErrorInfo.{0,12}?\[(\d+)\]', re.DOTALL)
+
+# Transient upstream rejections that recover on retry (observed: anonymous
+# access fails randomly with 1060 at ~20% rate regardless of prompt size).
+_TRANSIENT_BARD_ERRORS = frozenset({1060})
+
+_BARD_ERROR_HINTS = {
+    1003: "Gemini rejected the attachment: anonymous mode cannot send files/images; configure a cookie first",
+    1060: "transient anonymous-mode rejection; retry usually recovers",
+    1097: "Gemini rejected conversation continuation: anonymous mode cannot continue chats (history must be flattened into a single prompt)",
+}
+
+
+class BardError(RuntimeError):
+    """Upstream BardErrorInfo rejection carrying the numeric error code."""
+
+    def __init__(self, code: int):
+        self.code = code
+        msg = f"Gemini upstream rejected request: BardErrorInfo [{code}]"
+        hint = _BARD_ERROR_HINTS.get(code)
+        if hint:
+            msg += f" - {hint}"
+        super().__init__(msg)
+
+
+def _raise_bard_error(raw: str) -> None:
+    """Raise BardError if the raw response embeds a BardErrorInfo frame."""
+    m = _BARD_ERROR_RE.search(raw or "")
+    if m:
+        raise BardError(int(m.group(1)))
+
 
 def log(msg: str):
     if CONFIG["log_requests"]:
@@ -224,9 +259,7 @@ def _extract_texts_from_line(line: str) -> list:
 
 def extract_response_text(raw: str) -> str:
     """Parse full response to get final text."""
-    bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
-    if bard_err:
-        raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
+    _raise_bard_error(raw)
     last_text = ""
     for line in raw.split("\n"):
         for t in _extract_texts_from_line(line):
@@ -257,6 +290,13 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
             return extract_response_text(raw)
+        except BardError as e:
+            last_err = e
+            if e.code not in _TRANSIENT_BARD_ERRORS:
+                raise
+            if attempt < CONFIG["retry_attempts"] - 1:
+                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: BardErrorInfo [{e.code}]")
+                time.sleep(CONFIG["retry_delay_sec"])
         except urllib.error.HTTPError as e:
             if e.code == 405 and update_bl_if_needed():
                 url = _get_url()
@@ -299,11 +339,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 for chunk in resp.iter_text():
                     buf += chunk
                     if "BardErrorInfo" in buf:
-                        bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
-                        if bard_err:
-                            raise RuntimeError(
-                                f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
-                            )
+                        _raise_bard_error(buf)
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
                         for t in _extract_texts_from_line(line):
@@ -316,6 +352,14 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                             if delta:
                                 yield delta
             return
+        except BardError as e:
+            last_err = e
+            # Only retry when nothing was emitted yet, to avoid duplicated deltas.
+            if e.code not in _TRANSIENT_BARD_ERRORS or emitted_raw_text:
+                raise
+            if attempt < CONFIG["retry_attempts"] - 1:
+                log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: BardErrorInfo [{e.code}]")
+                time.sleep(CONFIG["retry_delay_sec"])
         except Exception as e:
             if HAS_HTTPX and hasattr(e, "response") and getattr(e.response, "status_code", 0) == 405:
                 if update_bl_if_needed():
