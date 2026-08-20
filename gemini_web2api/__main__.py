@@ -4,7 +4,7 @@ import os
 
 from .config import CONFIG, load_config, find_config
 from .models import MODELS
-from .gemini import HAS_HTTPX
+from .gemini import HAS_HTTPX, fetch_latest_bl
 from .server import GeminiHandler, ThreadedServer
 from . import __version__
 
@@ -42,6 +42,7 @@ def main():
     print(f"  Cookie:    {'yes' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
     print(f"  Proxy:     {CONFIG.get('proxy') or 'system env'}")
     print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'urllib (buffered)'}")
+    print(f"  Temporary: {'yes' if CONFIG.get('temporary_chats', False) else 'no'}")
     print()
     try:
         server.serve_forever()
